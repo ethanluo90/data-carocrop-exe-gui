@@ -1,0 +1,14 @@
+venv/
+dist/
+build/
+__pycache__/
+input/*
+output/*
+crop_logs/
+test_out/
+*.spec
+*.pyc
+dummy_*.png
+test_*.py
+nuitka-crash-report.xml
+runs/
