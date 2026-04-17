@@ -1037,83 +1037,112 @@ def solve_square_crop(
     image_size: Tuple[int, int],
     padding_percent: float = 0.06,
     artifact_boxes: list = None,
-) -> Tuple[int, int, int, int]:
+) -> Tuple[int, int, int, int, dict]:
     """
-    Solves for the optimal square crop that contains required_bounds with padding.
-    Uses "Pure Crop" constrained-centering: the square is perfectly centered on
-    the required_bounds, and its size is shrunk to avoid image edges and artifacts.
+    Solve for a square crop that contains required_bounds plus padding.
+
+    Unlike pure center-locking, this solver can shift the square within image bounds
+    to preserve the requested padding whenever possible.
+
+    Returns:
+        (left, top, right, bottom, debug_info)
     """
     width, height = image_size
     req_left, req_top, req_right, req_bottom = required_bounds
 
+    req_left, req_top, req_right, req_bottom = _clip_ltrb(required_bounds, width, height)
+
     # Calculate dimensions
     req_w = req_right - req_left
     req_h = req_bottom - req_top
-    
+
     # Calculate padding based on product size
     pad_left = int(req_w * padding_percent)
     pad_right = int(req_w * padding_percent)
     pad_top = int(req_h * padding_percent)
     pad_bottom = int(req_h * padding_percent)
 
-    # --- Pure Crop Centering ---
-    # We find the center of the required bounds and find the maximum square size
-    # that stays within image bounds AND stays away from artifacts.
-    cx = (req_left + req_right) // 2
-    cy = (req_top + req_bottom) // 2
-    
-    # Target size based on product + padding
+    # Requested square from padded required bounds.
     target_square = max(req_w + pad_left + pad_right, req_h + pad_top + pad_bottom)
-    
-    # 1. Image boundary constraints
-    dist_l = cx
-    dist_r = width - cx
-    dist_t = cy
-    dist_b = height - cy
-    
-    max_radius = min(dist_l, dist_r, dist_t, dist_b)
-    
-    # 2. Artifact constraints
-    if artifact_boxes:
+    min_cover_square = max(req_w, req_h)
+    max_image_square = min(width, height)
+
+    # Fit request inside image limits while still covering required bounds.
+    square_size = int(max(min_cover_square, min(target_square, max_image_square)))
+
+    req_cx = (req_left + req_right) / 2.0
+    req_cy = (req_top + req_bottom) / 2.0
+
+    def _feasible_interval(axis_len: int, req_lo: int, req_hi: int, size: int):
+        lo = max(0, req_hi - size)
+        hi = min(axis_len - size, req_lo)
+        return lo, hi
+
+    x_lo, x_hi = _feasible_interval(width, req_left, req_right, square_size)
+    y_lo, y_hi = _feasible_interval(height, req_top, req_bottom, square_size)
+
+    # If needed, shrink slightly until both axes have a feasible placement.
+    while (x_lo > x_hi or y_lo > y_hi) and square_size > min_cover_square:
+        square_size -= 1
+        x_lo, x_hi = _feasible_interval(width, req_left, req_right, square_size)
+        y_lo, y_hi = _feasible_interval(height, req_top, req_bottom, square_size)
+
+    # Final safety fallback.
+    if x_lo > x_hi or y_lo > y_hi:
+        square_size = max(1, min(width, height))
+        x_lo, x_hi = 0, max(0, width - square_size)
+        y_lo, y_hi = 0, max(0, height - square_size)
+
+    # Prefer centered placement, then clamp into feasible interval.
+    preferred_left = int(round(req_cx - square_size / 2.0))
+    preferred_top = int(round(req_cy - square_size / 2.0))
+    base_left = max(x_lo, min(x_hi, preferred_left))
+    base_top = max(y_lo, min(y_hi, preferred_top))
+
+    def _artifact_penalty(left: int, top: int, size: int) -> float:
+        if not artifact_boxes:
+            return 0.0
+        right = left + size
+        bottom = top + size
+        penalty = 0.0
         for box in artifact_boxes:
             al, at, ar, ab = box[:4]
-            # Skip artifacts that are completely inside the required product box.
-            # (Internal artifacts should have been handled by shrinking product box in YOLO layer)
+            # Ignore artifacts fully inside required object box.
             if al >= req_left and ar <= req_right and at >= req_top and ab <= req_bottom:
                 continue
-                
-            # For EACH artifact, the maximum safe radius is the LARGEST of the 4 side-constraints
-            # that keeps the square from intersecting the artifact.
-            r_l = (cx - ar) if ar < cx else -1
-            r_r = (al - cx) if al > cx else -1
-            r_t = (cy - ab) if ab < cy else -1
-            r_b = (at - cy) if at > cy else -1
-            
-            safe_r_for_this_artifact = max(r_l, r_r, r_t, r_b)
-            
-            # If the artifact overlaps the center point in BOTH axes, it's unavoidable 
-            # while staying centered. This shouldn't happen with good detection.
-            if safe_r_for_this_artifact < 0:
-                print(f"     [CROP-SOLVER] Warning: Artifact at ({al},{at},{ar},{ab}) overlaps center ({cx},{cy})")
-                safe_r_for_this_artifact = 0
-                
-            max_radius = min(max_radius, safe_r_for_this_artifact)
-                
-    # Final square size MUST be at least big enough to cover the product (if possible)
-    final_radius = max_radius
-    if final_radius * 2 > target_square:
-        final_radius = target_square // 2
-        
-    square_size = int(final_radius * 2)
-    
-    crop_left = cx - final_radius
-    crop_top = cy - final_radius
+            ix1 = max(left, al)
+            iy1 = max(top, at)
+            ix2 = min(right, ar)
+            iy2 = min(bottom, ab)
+            if ix1 < ix2 and iy1 < iy2:
+                penalty += float((ix2 - ix1) * (iy2 - iy1))
+        return penalty
+
+    # Evaluate a small set of feasible candidates and pick lowest artifact overlap,
+    # with tie-breaker favoring closer-to-center placement.
+    x_candidates = sorted(set([x_lo, base_left, x_hi]))
+    y_candidates = sorted(set([y_lo, base_top, y_hi]))
+
+    best = None
+    for left in x_candidates:
+        for top in y_candidates:
+            penalty = _artifact_penalty(left, top, square_size)
+            center_dist = abs((left + square_size / 2.0) - req_cx) + abs((top + square_size / 2.0) - req_cy)
+            rank = (penalty, center_dist)
+            if best is None or rank < best[0]:
+                best = (rank, left, top, penalty)
+
+    _, crop_left, crop_top, penalty = best
     crop_right = crop_left + square_size
     crop_bottom = crop_top + square_size
-    
-    # No shifting allowed. Coordinates are clipped only as a final safety check, 
-    # but the math above should ensure they are in-bounds.
-    return int(crop_left), int(crop_top), int(crop_right), int(crop_bottom)
+
+    debug_info = {
+        "padding_percent": float(padding_percent),
+        "target_square": int(target_square),
+        "final_square": int(square_size),
+        "artifact_overlap_px": float(penalty),
+    }
+    return int(crop_left), int(crop_top), int(crop_right), int(crop_bottom), debug_info
 
 
 def border_contamination(strip, bg_ref=(255, 255, 255), dark_thresh=40):
@@ -1264,7 +1293,7 @@ def tight_crop_to_object(image: Image.Image, padding_percent: float = DEFAULT_PA
     else:
         required_ltrb = product_ltrb
 
-    crop_left, crop_top, crop_right, crop_bottom = solve_square_crop(
+    crop_left, crop_top, crop_right, crop_bottom, solver_debug = solve_square_crop(
         required_bounds=required_ltrb,
         image_size=(width, height),
         padding_percent=padding_percent,
@@ -1282,7 +1311,8 @@ def tight_crop_to_object(image: Image.Image, padding_percent: float = DEFAULT_PA
             required_bounds=required_ltrb,
             proposed_crop=(crop_left, crop_top, crop_right, crop_bottom),
             square_size=square_size,
-            strategy_used="tight_crop"
+            strategy_used="tight_crop_shifted",
+            padding_adjustments=solver_debug,
         )
         logger.log_image_dimensions(image.size, (square_size, square_size))
         if yolo_artifacts:
@@ -1594,7 +1624,16 @@ def process_image(input_path: Path, output_dir: Path, config: dict = None, log_c
         else:
             # Step 2: Tight crop to object
             dlog("  -> Tight cropping to object...")
-            cropped = tight_crop_to_object(original, padding_percent=0.04, logger=logger)
+            active_padding = DEFAULT_PADDING_PCT
+            if config and 'padding' in config:
+                try:
+                    active_padding = float(config['padding'])
+                except Exception:
+                    active_padding = DEFAULT_PADDING_PCT
+            # Guard against invalid values coming from external callers.
+            active_padding = max(0.0, min(0.25, active_padding))
+            dlog(f"     Crop padding: {active_padding*100:.1f}%")
+            cropped = tight_crop_to_object(original, padding_percent=active_padding, logger=logger)
             dlog(f"     Output: {cropped.width}x{cropped.height}")
             
             # Step 3: Optional localized backdrop normalization
